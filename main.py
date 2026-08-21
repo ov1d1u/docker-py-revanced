@@ -15,10 +15,12 @@ from src.exceptions import AppNotFoundError, BuilderError, PatchesJsonLoadError,
 from src.parser import Parser
 from src.patches import Patches
 from src.utils import (
+    app_version_key,
     check_java,
     delete_old_changelog,
     generate_obtainium_export,
     load_older_updates,
+    patches_versions_key,
     save_patch_info,
     write_changelog_to_file,
 )
@@ -39,10 +41,39 @@ def get_app(config: RevancedConfig, app_name: str) -> APP:
     return APP(app_name=app_name, package_name=package_name, config=config)
 
 
+def _unchanged_since_last_run(
+    app: APP,
+    app_name: str,
+    config: RevancedConfig,
+    previous_updates_info: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the prior run's update info for app_name if nothing worth rebuilding has changed.
+
+    A rebuild is skipped only when the app version and every patch bundle version match the last
+    recorded run *and* that run's output APK is still present on disk. Otherwise this returns None,
+    signalling that patch_app must run.
+    """
+    previous_entry = previous_updates_info.get(app_name)
+    if not previous_entry:
+        return None
+    if previous_entry.get(app_version_key) != app.app_version:
+        return None
+    if previous_entry.get(patches_versions_key) != app.get_patch_bundles_versions():
+        return None
+    previous_output_file_name = previous_entry.get("output_file_name")
+    if not previous_output_file_name:
+        return None
+    if not config.temp_folder.joinpath(previous_output_file_name).is_file():
+        # The recorded output is gone (cleaned up, moved, uploaded-and-deleted, ...); rebuild it.
+        return None
+    return previous_entry
+
+
 def process_single_app(
     app_name: str,
     config: RevancedConfig,
     caches: AppCaches,
+    previous_updates_info: dict[str, Any],
 ) -> dict[str, Any]:
     """Process a single app and return its update info."""
     download_cache, resource_cache, download_lock, resource_lock = caches
@@ -62,6 +93,15 @@ def process_single_app(
 
         parser.include_exclude_patch(app, app_all_patches, patcher.patches_dict)
         logger.info(app)
+
+        reusable_entry = _unchanged_since_last_run(app, app_name, config, previous_updates_info)
+        if reusable_entry is not None:
+            logger.info(
+                f"Skipping patch for {app_name}: app version and patch bundle versions "
+                "unchanged since last run, reusing existing output.",
+            )
+            return {app_name: reusable_entry}
+
         app_update_info = save_patch_info(app, {})
         parser.patch_app(app)
     except AppNotFoundError as e:
@@ -100,11 +140,12 @@ def _process_apps_sequentially(
     caches: AppCaches,
     updates_info: dict[str, Any],
     failed_apps: list[str],
+    previous_updates_info: dict[str, Any],
 ) -> None:
     """Process apps one-by-one for single-app and CI-test runs."""
     for app_name in config.apps:
         try:
-            app_updates = process_single_app(app_name, config, caches)
+            app_updates = process_single_app(app_name, config, caches, previous_updates_info)
             updates_info.update(app_updates)
         except Exception as e:  # noqa: BLE001
             _record_failed_app(app_name, e, failed_apps)
@@ -115,6 +156,7 @@ def _process_apps_in_parallel(
     caches: AppCaches,
     updates_info: dict[str, Any],
     failed_apps: list[str],
+    previous_updates_info: dict[str, Any],
 ) -> None:
     """Process apps with worker concurrency while preserving aggregate failure reporting."""
     # Worker count is capped by app count and operator config so a large env file does not overload the runner.
@@ -125,7 +167,7 @@ def _process_apps_in_parallel(
         # Submitting everything first lets independent apps finish even if one app fails early.
         future_to_app = {}
         for app_name in config.apps:
-            future = executor.submit(process_single_app, app_name, config, caches)
+            future = executor.submit(process_single_app, app_name, config, caches, previous_updates_info)
             future_to_app[future] = app_name
         total_apps = len(config.apps)
 
@@ -167,6 +209,9 @@ def main() -> None:
         check_java()
         delete_old_changelog()
         updates_info = load_older_updates(env)
+    # Snapshot before this run starts mutating updates_info, so skip-checks compare against
+    # last run's recorded versions rather than results other apps just produced in this run.
+    previous_updates_info = dict(updates_info)
 
     logger.info(f"Will Patch only {len(config.apps)} apps-:\n{config.apps}")
 
@@ -178,9 +223,9 @@ def main() -> None:
 
     try:
         if len(config.apps) == 1 or config.ci_test:
-            _process_apps_sequentially(config, caches, updates_info, failed_apps)
+            _process_apps_sequentially(config, caches, updates_info, failed_apps, previous_updates_info)
         else:
-            _process_apps_in_parallel(config, caches, updates_info, failed_apps)
+            _process_apps_in_parallel(config, caches, updates_info, failed_apps, previous_updates_info)
     finally:
         # Always write partial metadata for successful apps before surfacing the aggregate failure.
         write_changelog_to_file(updates_info)
