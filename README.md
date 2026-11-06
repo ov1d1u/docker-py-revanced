@@ -137,6 +137,7 @@ You can use any of the following methods to build.
 | MAX_RESOURCE_WORKERS                                     |        Maximum workers for downloading resources        | 3                                                                                                                     |
 | MAX_PARALLEL_APPS                                        |      Maximum number of apps to process in parallel      | 4                                                                                                                     |
 | DISABLE_CACHING                                          |          Disable download and resource caching          | False                                                                                                                 |
+| UPDATES_FILE | Local path of `updates.json` (last run's versions, used to skip unchanged apps) | `updates.json` if GITHUB_REPOSITORY is set, else `apks/updates.json` |
 
 `*` - Can be overridden for individual app.
 ### App Level Config

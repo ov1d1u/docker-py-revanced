@@ -228,7 +228,7 @@ def main() -> None:
             _process_apps_in_parallel(config, caches, updates_info, failed_apps, previous_updates_info)
     finally:
         # Always write partial metadata for successful apps before surfacing the aggregate failure.
-        write_changelog_to_file(updates_info)
+        write_changelog_to_file(updates_info, env)
         generate_obtainium_export(updates_info, config)
 
     _raise_if_no_apps_succeeded(failed_apps, updates_info)

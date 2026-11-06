@@ -117,7 +117,7 @@ def format_changelog(name: str, response: dict[str, str]) -> dict[str, str]:
     }
 
 
-def write_changelog_to_file(updates_info: dict[str, Any]) -> None:
+def write_changelog_to_file(updates_info: dict[str, Any], env: Env | None = None) -> None:
     """The function `write_changelog_to_file` writes a given changelog json to a file."""
     markdown_table = inspect.cleandoc(
         """
@@ -142,7 +142,9 @@ def write_changelog_to_file(updates_info: dict[str, Any]) -> None:
     with Path(changelog_file).open("w", encoding="utf_8") as file1:
         file1.write(markdown_table)
     Path(changelog_json_file).write_text(json.dumps(changelogs, indent=4) + "\n")
-    Path(updates_file).write_text(json.dumps(updates_info, indent=4, default=str) + "\n")
+    updates_path = get_updates_file_path(env) if env is not None else Path(updates_file)
+    updates_path.parent.mkdir(parents=True, exist_ok=True)
+    updates_path.write_text(json.dumps(updates_info, indent=4, default=str) + "\n")
 
 
 def get_parent_repo() -> str:
@@ -271,19 +273,53 @@ def datetime_to_ms_epoch(dt: datetime) -> int:
     return round(microseconds / float(1000))
 
 
-def load_older_updates(env: Env) -> dict[str, Any]:
-    """Load older updated from updates.json."""
-    try:
-        update_file_url = updates_file_url.format(
-            github_repository=env.str("GITHUB_REPOSITORY"),
-            branch_name=branch_name,
-            updates_file=updates_file,
-        )
-        with urllib.request.urlopen(update_file_url) as url:
-            return json.load(url)  # type: ignore[no-any-return]
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"Failed to retrieve update file: {e}")
+def get_updates_file_path(env: Env) -> Path:
+    """Return where updates.json is read from and written to locally.
+
+    UPDATES_FILE overrides the path. Otherwise GitHub Actions runs keep the repo-root file (the workflow
+    publishes it to the changelogs branch), while self-hosted runs keep it next to the APKs so it survives
+    container restarts when only the apks folder is persisted.
+    """
+    override = env.str("UPDATES_FILE", "")
+    if override:
+        return Path(override)
+    if env.str("GITHUB_REPOSITORY", ""):
+        return Path(updates_file)
+    return Path(resource_folder) / updates_file
+
+
+def _load_local_updates(path: Path) -> dict[str, Any]:
+    """Read a local updates.json, returning {} if it is missing or unreadable."""
+    if not path.is_file():
+        logger.info(f"No local update file at {path}; starting fresh.")
         return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf_8"))
+    except (OSError, ValueError) as e:
+        logger.error(f"Failed to read local update file {path}: {e}")
+        return {}
+    if not isinstance(data, dict):
+        logger.error(f"Ignoring local update file {path}: expected a JSON object.")
+        return {}
+    logger.info(f"Loaded previous update info from {path}")
+    return data
+
+
+def load_older_updates(env: Env) -> dict[str, Any]:
+    """Load older updates from the changelogs branch on GitHub, falling back to a local updates.json."""
+    github_repository = env.str("GITHUB_REPOSITORY", "")
+    if github_repository:
+        try:
+            update_file_url = updates_file_url.format(
+                github_repository=github_repository,
+                branch_name=branch_name,
+                updates_file=updates_file,
+            )
+            with urllib.request.urlopen(update_file_url) as url:
+                return json.load(url)  # type: ignore[no-any-return]
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to retrieve update file: {e}")
+    return _load_local_updates(get_updates_file_path(env))
 
 
 def save_patch_info(app: "APP", updates_info: dict[str, Any]) -> dict[str, Any]:
